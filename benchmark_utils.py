@@ -5,12 +5,18 @@ import mimetypes
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
+import warnings
+import zipfile
+from html import unescape
 from typing import Any
 from urllib.parse import unquote, urlparse
+from xml.etree import ElementTree as ET
 
 from braintrust import Attachment
+from openai import OpenAI, RateLimitError
 
 DEFAULT_MODEL = "gpt-4.1-mini"
 DEFAULT_JUDGE_MODEL = "gpt-4.1-mini"
@@ -23,6 +29,8 @@ MAX_REFERENCE_CONTENT_TOTAL_CHARS = 500_000
 MAX_GENERATED_FILES = 4
 MAX_GENERATED_CONTENT_CHARS_PER_FILE = 80_000
 FETCH_TIMEOUT_SEC = 90
+MAX_OPENAI_RETRIES = 6
+INITIAL_OPENAI_BACKOFF_SEC = 0.5
 
 
 def suffix_from_url(url: str) -> str:
@@ -91,7 +99,10 @@ def extract_xlsx_text(data: bytes) -> str:
     from openpyxl import load_workbook
 
     buf = io.BytesIO(data)
-    wb = load_workbook(buf, read_only=True, data_only=True)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Unknown extension is not supported and will be removed")
+        warnings.filterwarnings("ignore", message="Cannot parse header or footer so it will be ignored")
+        wb = load_workbook(buf, read_only=True, data_only=True)
     try:
         parts: list[str] = []
         for sheet in wb:
@@ -122,6 +133,49 @@ def extract_docx_text(data: bytes) -> str:
             if any(cells):
                 parts.append("\t".join(cells))
     return "\n".join(parts) if parts else "(empty document)"
+
+
+def extract_docx_text_fallback(data: bytes) -> str:
+    namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+
+    def part_text(xml_bytes: bytes) -> list[str]:
+        try:
+            root = ET.fromstring(xml_bytes)
+            lines: list[str] = []
+            for paragraph in root.findall(".//w:p", namespace):
+                fragments: list[str] = []
+                for node in paragraph.iter():
+                    tag = node.tag.rsplit("}", 1)[-1] if "}" in node.tag else node.tag
+                    if tag == "t" and node.text:
+                        fragments.append(node.text)
+                    elif tag == "tab":
+                        fragments.append("\t")
+                    elif tag in {"br", "cr"}:
+                        fragments.append("\n")
+                text = "".join(fragments).strip()
+                if text:
+                    lines.append(text)
+            return lines
+        except ET.ParseError:
+            text = re.sub(r"<[^>]+>", " ", xml_bytes.decode("utf-8", errors="ignore"))
+            text = re.sub(r"\s+", " ", unescape(text)).strip()
+            return [text] if text else []
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            collected: list[str] = []
+            for name in zf.namelist():
+                if not name.startswith("word/"):
+                    continue
+                if not name.endswith(".xml"):
+                    continue
+                if "document.xml" not in name and "header" not in name and "footer" not in name:
+                    continue
+                collected.extend(part_text(zf.read(name)))
+    except (zipfile.BadZipFile, KeyError, OSError):
+        return ""
+
+    return "\n".join(collected) if collected else ""
 
 
 def extract_pptx_text(data: bytes) -> str:
@@ -167,7 +221,10 @@ def extract_reference_document_text(source: str, data: bytes, suffix: str) -> st
         if suffix == ".xlsx":
             raw = extract_xlsx_text(data)
         elif suffix == ".docx":
-            raw = extract_docx_text(data)
+            try:
+                raw = extract_docx_text(data)
+            except Exception:
+                raw = extract_docx_text_fallback(data)
         elif suffix == ".pptx":
             raw = extract_pptx_text(data)
         elif suffix == ".pdf":
@@ -515,3 +572,22 @@ def output_to_scoring_text(output: Any) -> str:
         if isinstance(narrative, str):
             return narrative
     return str(output)
+
+
+def create_chat_completion_with_retries(
+    client: OpenAI,
+    **kwargs: Any,
+):
+    delay = INITIAL_OPENAI_BACKOFF_SEC
+    last_error: Exception | None = None
+    for attempt in range(MAX_OPENAI_RETRIES):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except RateLimitError as err:
+            last_error = err
+            if attempt == MAX_OPENAI_RETRIES - 1:
+                break
+            time.sleep(delay)
+            delay *= 2
+    assert last_error is not None
+    raise last_error

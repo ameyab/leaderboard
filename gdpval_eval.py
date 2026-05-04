@@ -28,21 +28,14 @@ from benchmark_utils import (
     DEFAULT_MODEL,
     build_artifacts,
     build_output_payload,
+    create_chat_completion_with_retries,
     format_reference_files_section,
     output_to_scoring_text,
-    source_file_attachments,
 )
 
 DEFAULT_PROJECT = "Leaderboard"
 DEFAULT_ARTIFACT_OUTPUT_DIR = "gdpval_generated_artifacts"
 USER_AGENT = "gdpval-eval/1.0 (reference fetcher)"
-SOURCE_FILE_PATHS = (
-    "gdpval_eval.py",
-    "benchmark_utils.py",
-    "publish_gdpval_dataset.py",
-    "publish_gdpval_scorer.py",
-    "requirements.txt",
-)
 
 
 def infer_target_suffixes(input_data: dict[str, Any]) -> list[str]:
@@ -100,6 +93,24 @@ def load_gdpval() -> list[dict[str, Any]]:
     ]
 
 
+def enrich_reference_inputs(data: list[dict[str, Any]]) -> None:
+    for row in data:
+        input_payload = row.get("input")
+        if not isinstance(input_payload, dict):
+            continue
+        ref_urls = input_payload.get("reference_file_urls") or []
+        if not ref_urls:
+            continue
+        reference_section, reference_attachments = format_reference_files_section(
+            ref_urls,
+            user_agent=USER_AGENT,
+        )
+        if reference_section:
+            input_payload["reference_prompt_section"] = reference_section
+        if reference_attachments:
+            input_payload["reference_files"] = reference_attachments
+
+
 def default_experiment_name(model: str) -> str:
     timestamp = datetime.now().strftime("%m-%d-%y-%H-%M")
     return f"GDPVAL-{model}-{timestamp}"
@@ -140,17 +151,18 @@ def make_task(model: str, client: OpenAI):
         ]
 
         ref_urls = input.get("reference_file_urls") or []
-        if ref_urls:
-            reference_section, reference_attachments = format_reference_files_section(
+        reference_section = input.get("reference_prompt_section")
+        if isinstance(reference_section, str) and reference_section:
+            messages[1]["content"] += reference_section
+        elif ref_urls:
+            fallback_section, _ = format_reference_files_section(
                 ref_urls,
                 user_agent=USER_AGENT,
             )
-            messages[1]["content"] += reference_section
-            if reference_attachments:
-                input["reference_files"] = reference_attachments
-        input["source_files"] = source_file_attachments(SOURCE_FILE_PATHS)
+            messages[1]["content"] += fallback_section
 
-        response = client.chat.completions.create(
+        response = create_chat_completion_with_retries(
+            client,
             model=model,
             messages=messages,
             response_format={"type": "json_object"},
@@ -190,7 +202,8 @@ def make_rubric_scorer(judge_model: str, client: OpenAI):
             criterion = item["criterion"]
             item_score = item["score"]
 
-            response = client.chat.completions.create(
+            response = create_chat_completion_with_retries(
+                client,
                 model=judge_model,
                 messages=[
                     {
@@ -270,6 +283,7 @@ def main() -> None:
     data = load_gdpval()
     if args.limit:
         data = data[: args.limit]
+    enrich_reference_inputs(data)
     print(f"Loaded {len(data)} rows", flush=True)
 
     Eval(

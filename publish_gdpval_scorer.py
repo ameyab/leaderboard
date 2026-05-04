@@ -24,7 +24,7 @@ from braintrust import projects
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-from benchmark_utils import output_to_scoring_text
+from benchmark_utils import create_chat_completion_with_retries, output_to_scoring_text
 
 PROJECT_NAME = os.getenv("BRAINTRUST_PROJECT", "gdpval")
 SCORER_NAME = os.getenv("GDPVAL_SCORER_NAME", "gdpval-rubric-scorer")
@@ -66,7 +66,8 @@ def gdpval_rubric_scorer(output: str, input: dict[str, Any], expected: Any = Non
         criterion = item["criterion"]
         item_score = float(item["score"])
 
-        response = client.chat.completions.create(
+        response = create_chat_completion_with_retries(
+            client,
             model=JUDGE_MODEL,
             messages=[
                 {
