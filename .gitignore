@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+
+# GDPVal
+gdpval_generated_artifacts/

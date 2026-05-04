@@ -24,6 +24,8 @@ from braintrust import projects
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
+from benchmark_utils import output_to_scoring_text
+
 PROJECT_NAME = os.getenv("BRAINTRUST_PROJECT", "gdpval")
 SCORER_NAME = os.getenv("GDPVAL_SCORER_NAME", "gdpval-rubric-scorer")
 SCORER_SLUG = os.getenv("GDPVAL_SCORER_SLUG", "gdpval-rubric-scorer")
@@ -44,7 +46,6 @@ def _extract_rubric_payload(input_payload: dict[str, Any]) -> dict[str, Any]:
         return nested
     return input_payload
 
-
 def gdpval_rubric_scorer(output: str, input: dict[str, Any], expected: Any = None) -> float:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
@@ -59,6 +60,7 @@ def gdpval_rubric_scorer(output: str, input: dict[str, Any], expected: Any = Non
     prompt = payload.get("prompt", "")
     client = OpenAI(api_key=api_key)
     earned_points = 0.0
+    output_text = _output_to_scoring_text(output)
 
     for item in rubric_items:
         criterion = item["criterion"]
@@ -78,7 +80,7 @@ def gdpval_rubric_scorer(output: str, input: dict[str, Any], expected: Any = Non
                     "role": "user",
                     "content": (
                         f"TASK:\n{prompt[:2000]}\n\n"
-                        f"RESPONSE:\n{output[:3000]}\n\n"
+                        f"RESPONSE:\n{output_text[:12000]}\n\n"
                         f"CRITERION: {criterion}\n\n"
                         "Does the response satisfy this criterion? Answer YES or NO only."
                     ),
