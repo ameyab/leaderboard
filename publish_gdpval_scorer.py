@@ -20,11 +20,11 @@ import json
 import os
 from typing import Any
 
-from braintrust import projects
+from braintrust import projects, wrap_openai
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-from benchmark_utils import create_chat_completion_with_retries, output_to_scoring_text
+from benchmark_utils import create_chat_completion_with_retries, normalize_rubric_score, output_to_scoring_text
 
 PROJECT_NAME = os.getenv("BRAINTRUST_PROJECT", "gdpval")
 SCORER_NAME = os.getenv("GDPVAL_SCORER_NAME", "gdpval-rubric-scorer")
@@ -53,12 +53,11 @@ def gdpval_rubric_scorer(output: str, input: dict[str, Any], expected: Any = Non
 
     payload = _extract_rubric_payload(input)
     rubric_items = json.loads(payload["rubric_json"])
-    total_points = sum(item["score"] for item in rubric_items)
-    if not rubric_items or total_points <= 0:
+    if not rubric_items:
         return 0.0
 
     prompt = payload.get("prompt", "")
-    client = OpenAI(api_key=api_key)
+    client = wrap_openai(OpenAI(api_key=api_key))
     earned_points = 0.0
     output_text = _output_to_scoring_text(output)
 
@@ -94,7 +93,7 @@ def gdpval_rubric_scorer(output: str, input: dict[str, Any], expected: Any = Non
         if "YES" in answer:
             earned_points += item_score
 
-    return earned_points / float(total_points)
+    return normalize_rubric_score(earned_points, rubric_items)
 
 
 project = projects.create(PROJECT_NAME)

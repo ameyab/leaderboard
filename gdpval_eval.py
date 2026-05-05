@@ -20,7 +20,7 @@ import sys
 from datetime import datetime
 from typing import Any
 
-from braintrust import Eval
+from braintrust import Eval, wrap_openai
 from openai import OpenAI
 
 from benchmark_utils import (
@@ -30,6 +30,7 @@ from benchmark_utils import (
     build_output_payload,
     create_chat_completion_with_retries,
     format_reference_files_section,
+    normalize_rubric_score,
     output_to_scoring_text,
 )
 
@@ -190,17 +191,15 @@ def make_rubric_scorer(judge_model: str, client: OpenAI):
     def rubric_scorer(input: dict[str, Any], output: Any, expected: Any = None) -> float:
         del expected
         rubric_items: list[dict[str, Any]] = json.loads(input["rubric_json"])
-        total_points = sum(item["score"] for item in rubric_items)
-
-        if total_points == 0 or not rubric_items:
+        if not rubric_items:
             return 0.0
 
-        earned_points = 0
+        earned_points = 0.0
         output_text = output_to_scoring_text(output)
 
         for item in rubric_items:
             criterion = item["criterion"]
-            item_score = item["score"]
+            item_score = float(item["score"])
 
             response = create_chat_completion_with_retries(
                 client,
@@ -231,7 +230,7 @@ def make_rubric_scorer(judge_model: str, client: OpenAI):
             if "YES" in answer:
                 earned_points += item_score
 
-        return earned_points / total_points
+        return normalize_rubric_score(earned_points, rubric_items)
 
     return rubric_scorer
 
@@ -256,7 +255,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--max-concurrency",
         type=int,
-        default=5,
+        default=1,
         help="Maximum number of concurrent eval tasks",
     )
     p.add_argument(
@@ -265,22 +264,52 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Evaluate only the first N rows (useful for testing)",
     )
+    p.add_argument(
+        "--range",
+        dest="row_range",
+        default=None,
+        help="Half-open row range START:END, e.g. 10:25 runs rows 10-24",
+    )
     args, _ = p.parse_known_args()
     return args
 
 
+def apply_row_range(data: list[dict[str, Any]], row_range: str | None) -> list[dict[str, Any]]:
+    if not row_range:
+        return data
+
+    parts = row_range.split(":", 1)
+    if len(parts) != 2:
+        raise ValueError(f"Invalid --range value {row_range!r}. Expected START:END")
+
+    start_str, end_str = parts
+    if not start_str or not end_str:
+        raise ValueError(f"Invalid --range value {row_range!r}. Expected START:END")
+
+    start = int(start_str)
+    end = int(end_str)
+    if start < 0 or end < 0 or end < start:
+        raise ValueError(f"Invalid --range value {row_range!r}. Expected 0 <= START <= END")
+
+    return data[start:end]
+
+
 def main() -> None:
     args = parse_args()
+    run_eval(args)
 
+
+def run_eval(args: argparse.Namespace) -> None:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         print("ERROR: OPENAI_API_KEY environment variable not set", file=sys.stderr)
         sys.exit(1)
 
-    client = OpenAI(api_key=api_key)
+    client = wrap_openai(OpenAI(api_key=api_key))
 
     print("Loading gdpval dataset...", flush=True)
     data = load_gdpval()
+    data = apply_row_range(data, args.row_range)
     if args.limit:
         data = data[: args.limit]
     enrich_reference_inputs(data)
@@ -299,6 +328,10 @@ def main() -> None:
         },
         max_concurrency=args.max_concurrency,
     )
+
+
+if __name__ != "__main__":
+    run_eval(parse_args())
 
 
 if __name__ == "__main__":

@@ -29,8 +29,8 @@ MAX_REFERENCE_CONTENT_TOTAL_CHARS = 500_000
 MAX_GENERATED_FILES = 4
 MAX_GENERATED_CONTENT_CHARS_PER_FILE = 80_000
 FETCH_TIMEOUT_SEC = 90
-MAX_OPENAI_RETRIES = 6
-INITIAL_OPENAI_BACKOFF_SEC = 0.5
+MAX_OPENAI_RETRIES = 12
+INITIAL_OPENAI_BACKOFF_SEC = 1.0
 
 
 def suffix_from_url(url: str) -> str:
@@ -100,22 +100,21 @@ def extract_xlsx_text(data: bytes) -> str:
 
     buf = io.BytesIO(data)
     with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="Unknown extension is not supported and will be removed")
-        warnings.filterwarnings("ignore", message="Cannot parse header or footer so it will be ignored")
+        warnings.filterwarnings("ignore", category=UserWarning, module=r"openpyxl\..*")
         wb = load_workbook(buf, read_only=True, data_only=True)
-    try:
-        parts: list[str] = []
-        for sheet in wb:
-            rows_out: list[str] = []
-            for row in sheet.iter_rows(values_only=True):
-                cells = ["" if c is None else str(c) for c in row]
-                if any(cells):
-                    rows_out.append("\t".join(cells))
-            if rows_out:
-                parts.append(f"## Sheet: {sheet.title}\n" + "\n".join(rows_out))
-        return "\n\n".join(parts) if parts else "(empty workbook)"
-    finally:
-        wb.close()
+        try:
+            parts: list[str] = []
+            for sheet in wb:
+                rows_out: list[str] = []
+                for row in sheet.iter_rows(values_only=True):
+                    cells = ["" if c is None else str(c) for c in row]
+                    if any(cells):
+                        rows_out.append("\t".join(cells))
+                if rows_out:
+                    parts.append(f"## Sheet: {sheet.title}\n" + "\n".join(rows_out))
+            return "\n\n".join(parts) if parts else "(empty workbook)"
+        finally:
+            wb.close()
 
 
 def extract_docx_text(data: bytes) -> str:
@@ -311,6 +310,13 @@ def sanitize_filename(filename: str, fallback_suffix: str) -> str:
     return candidate
 
 
+def sanitize_excel_sheet_title(title: str, fallback: str) -> str:
+    cleaned = re.sub(r"[:\\/*?\[\]]", "_", (title or "").strip())
+    cleaned = cleaned.strip("'")
+    cleaned = cleaned[:31].strip()
+    return cleaned or fallback[:31] or "Sheet"
+
+
 def string_rows(raw_rows: Any) -> list[list[str]]:
     if not isinstance(raw_rows, list):
         return []
@@ -364,11 +370,19 @@ def build_xlsx(path: str, spec: dict) -> None:
     wb = Workbook()
     default_sheet = wb.active
     wb.remove(default_sheet)
+    used_names: set[str] = set()
 
     sheets = spec.get("sheets")
     if isinstance(sheets, list):
         for idx, sheet_spec in enumerate(sheets, start=1):
-            name = str((sheet_spec or {}).get("name") or f"Sheet{idx}").strip()[:31] or f"Sheet{idx}"
+            base_name = sanitize_excel_sheet_title(str((sheet_spec or {}).get("name") or f"Sheet{idx}"), f"Sheet{idx}")
+            name = base_name
+            counter = 2
+            while name in used_names:
+                suffix = f"_{counter}"
+                name = (base_name[: max(0, 31 - len(suffix))] + suffix) or f"Sheet{idx}"
+                counter += 1
+            used_names.add(name)
             ws = wb.create_sheet(title=name)
             for row in string_rows((sheet_spec or {}).get("rows")):
                 ws.append(row)
@@ -574,6 +588,43 @@ def output_to_scoring_text(output: Any) -> str:
     return str(output)
 
 
+def normalize_rubric_score(earned_points: float, rubric_items: list[dict[str, Any]]) -> float:
+    min_points = float(sum(float(item["score"]) for item in rubric_items if float(item["score"]) < 0))
+    max_points = float(sum(float(item["score"]) for item in rubric_items if float(item["score"]) > 0))
+    score_range = max_points - min_points
+    if score_range <= 0:
+        return 0.0
+    normalized = (earned_points - min_points) / score_range
+    return max(0.0, min(1.0, normalized))
+
+
+def _retry_delay_from_error(err: RateLimitError, fallback_delay: float) -> float:
+    response = getattr(err, "response", None)
+    if response is not None:
+        headers = getattr(response, "headers", {}) or {}
+        retry_after = headers.get("retry-after-ms") or headers.get("x-ratelimit-reset-requests-ms")
+        if retry_after:
+            try:
+                return max(float(retry_after) / 1000.0, fallback_delay)
+            except ValueError:
+                pass
+        retry_after = headers.get("retry-after")
+        if retry_after:
+            try:
+                return max(float(retry_after), fallback_delay)
+            except ValueError:
+                pass
+
+    message = str(err)
+    match = re.search(r"try again in ([0-9.]+)ms", message, re.IGNORECASE)
+    if match:
+        return max(float(match.group(1)) / 1000.0, fallback_delay)
+    match = re.search(r"try again in ([0-9.]+)s", message, re.IGNORECASE)
+    if match:
+        return max(float(match.group(1)), fallback_delay)
+    return fallback_delay
+
+
 def create_chat_completion_with_retries(
     client: OpenAI,
     **kwargs: Any,
@@ -587,7 +638,8 @@ def create_chat_completion_with_retries(
             last_error = err
             if attempt == MAX_OPENAI_RETRIES - 1:
                 break
+            delay = _retry_delay_from_error(err, delay)
             time.sleep(delay)
-            delay *= 2
+            delay = min(delay * 2, 30.0)
     assert last_error is not None
     raise last_error
