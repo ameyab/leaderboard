@@ -16,10 +16,10 @@ from urllib.parse import unquote, urlparse
 from xml.etree import ElementTree as ET
 
 from braintrust import Attachment
-from openai import OpenAI, RateLimitError
+from openai import BadRequestError, OpenAI, RateLimitError
 
-DEFAULT_MODEL = "gpt-4.1-mini"
-DEFAULT_JUDGE_MODEL = "gpt-4.1-mini"
+DEFAULT_MODEL = "gpt-5.4-mini"
+DEFAULT_JUDGE_MODEL = "gpt-5.4-mini"
 
 REFERENCE_DOCUMENT_SUFFIXES = frozenset({".xlsx", ".docx", ".pptx", ".pdf"})
 GENERATABLE_SUFFIXES = frozenset({".xlsx", ".docx", ".pptx", ".pdf"})
@@ -598,6 +598,14 @@ def normalize_rubric_score(earned_points: float, rubric_items: list[dict[str, An
     return max(0.0, min(1.0, normalized))
 
 
+def normalize_chat_completion_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(kwargs)
+    model = str(normalized.get("model") or "")
+    if model.startswith("gpt-5") and "max_tokens" in normalized and "max_completion_tokens" not in normalized:
+        normalized["max_completion_tokens"] = normalized.pop("max_tokens")
+    return normalized
+
+
 def _retry_delay_from_error(err: RateLimitError, fallback_delay: float) -> float:
     response = getattr(err, "response", None)
     if response is not None:
@@ -631,9 +639,10 @@ def create_chat_completion_with_retries(
 ):
     delay = INITIAL_OPENAI_BACKOFF_SEC
     last_error: Exception | None = None
+    request_kwargs = normalize_chat_completion_kwargs(kwargs)
     for attempt in range(MAX_OPENAI_RETRIES):
         try:
-            return client.chat.completions.create(**kwargs)
+            return client.chat.completions.create(**request_kwargs)
         except RateLimitError as err:
             last_error = err
             if attempt == MAX_OPENAI_RETRIES - 1:
@@ -641,5 +650,20 @@ def create_chat_completion_with_retries(
             delay = _retry_delay_from_error(err, delay)
             time.sleep(delay)
             delay = min(delay * 2, 30.0)
+        except BadRequestError as err:
+            last_error = err
+            error_body = getattr(err, "body", {}) or {}
+            error_details = error_body.get("error", {}) if isinstance(error_body, dict) else {}
+            unsupported_param = error_details.get("param")
+            message = str(error_details.get("message") or err)
+            if (
+                unsupported_param == "max_tokens"
+                and "max_completion_tokens" in message
+                and "max_tokens" in request_kwargs
+                and "max_completion_tokens" not in request_kwargs
+            ):
+                request_kwargs["max_completion_tokens"] = request_kwargs.pop("max_tokens")
+                continue
+            raise
     assert last_error is not None
     raise last_error
