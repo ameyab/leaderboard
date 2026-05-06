@@ -25,6 +25,7 @@ from openai import OpenAI
 
 from benchmark_utils import (
     DEFAULT_JUDGE_MODEL,
+    DEFAULT_JUDGE_MAX_TOKENS,
     DEFAULT_MODEL,
     build_artifacts,
     build_output_payload,
@@ -222,7 +223,7 @@ def make_rubric_scorer(judge_model: str, client: OpenAI):
                         ),
                     },
                 ],
-                max_tokens=5,
+                max_tokens=DEFAULT_JUDGE_MAX_TOKENS,
                 temperature=0,
             )
 

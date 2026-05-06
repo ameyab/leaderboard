@@ -20,6 +20,7 @@ from openai import BadRequestError, OpenAI, RateLimitError
 
 DEFAULT_MODEL = "gpt-5.4-mini"
 DEFAULT_JUDGE_MODEL = "gpt-5.4-mini"
+DEFAULT_JUDGE_MAX_TOKENS = 64
 
 REFERENCE_DOCUMENT_SUFFIXES = frozenset({".xlsx", ".docx", ".pptx", ".pdf"})
 GENERATABLE_SUFFIXES = frozenset({".xlsx", ".docx", ".pptx", ".pdf"})
